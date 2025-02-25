@@ -8,6 +8,7 @@ import (
 	"go/parser"
 	"go/token"
 	"io"
+	"iter"
 	"os"
 	"slices"
 )
@@ -33,6 +34,68 @@ type method struct {
 type mock struct {
 	name    string
 	methods []method
+}
+
+type UnaryOp int
+
+const (
+	UnaryStar  UnaryOp = 1
+	UnarySlice UnaryOp = 2
+)
+
+type UnaryOpStack []UnaryOp
+
+func (u UnaryOpStack) String() string {
+	var s string
+	for _, op := range u {
+		switch op {
+		case UnaryStar:
+			s += "*"
+		case UnarySlice:
+			s += "[]"
+		}
+	}
+	return s
+}
+
+func iterFileMapFunctionDeclarations(fileMap map[string]*ast.Package, typeToMock string) iter.Seq[*ast.FuncDecl] {
+	return func(yield func(decl *ast.FuncDecl) bool) {
+		for _, file := range fileMap {
+			for _, f := range file.Files {
+			DECLS:
+				for _, decl := range f.Decls {
+					// We only care about function declarations that also have a receiver.
+					// This is because we're looking for methods to mock.
+					d, isFunctionDeclaration := decl.(*ast.FuncDecl)
+					if !isFunctionDeclaration {
+						continue DECLS
+					}
+					if d.Recv == nil {
+						continue DECLS
+					}
+
+					for _, field := range d.Recv.List {
+						switch t := field.Type.(type) {
+						case *ast.StarExpr:
+							ident, isIdent := t.X.(*ast.Ident)
+							if !isIdent {
+								continue DECLS
+							}
+
+							if ident.Name != typeToMock {
+								continue DECLS
+							}
+
+							if !token.IsExported(d.Name.Name) {
+								continue DECLS
+							}
+						}
+					}
+					yield(d)
+				}
+			}
+		}
+	}
 }
 
 func main() {
@@ -65,119 +128,24 @@ func main() {
 
 	fileMap, err := parser.ParseDir(fset, *packagePath, nil, parser.ParseComments)
 	if err != nil {
-		os.Stderr.WriteString("Error parsing package: " + err.Error() + "\n")
+		_, _ = os.Stderr.WriteString("Error parsing package: " + err.Error() + "\n")
 		os.Exit(1)
 	}
 
 	schmock := mock{}
 
 	// We iterate over the declarations in all Go files in the package
-	for _, file := range fileMap {
-		for _, f := range file.Files {
-			for _, decl := range f.Decls {
+	for d := range iterFileMapFunctionDeclarations(fileMap, *implementation) {
+		methodName := d.Name.Name
+		m := method{name: methodName}
 
-				// We only care about function declarations that also have a receiver.
-				// This is because we're looking for methods to mock.
-				switch d := decl.(type) {
-				case *ast.FuncDecl:
-					if d.Recv == nil {
-						continue
-					}
+		// We collect the method parameters with all the necessary information
+		m.params = collectFields(d.Type.Params)
 
-					for _, field := range d.Recv.List {
-						switch t := field.Type.(type) {
-						case *ast.StarExpr:
-							if ident, ok := t.X.(*ast.Ident); ok {
+		// We collect the method return values with all the necessary information
+		m.returns = collectFields(d.Type.Results)
 
-								if ident.Name == *implementation {
-									isExported := token.IsExported(d.Name.Name)
-									if !isExported {
-										continue
-									}
-
-									methodName := d.Name.Name
-									m := method{name: methodName}
-
-									for _, p := range d.Type.Params.List {
-										switch pType := p.Type.(type) {
-										case *ast.SelectorExpr:
-											paramTypeName := pType.X.(*ast.Ident).Name
-											paramTypeSel := pType.Sel.Name
-											paramTypeFmt := fmt.Sprintf("%s.%s", paramTypeName, paramTypeSel)
-											for _, n := range p.Names {
-												m.params = append(m.params, param{name: n.Name, typ: paramTypeFmt})
-											}
-										case *ast.Ident:
-											for _, n := range p.Names {
-												m.params = append(m.params, param{name: n.Name, typ: pType.Name})
-											}
-										default:
-											continue
-										}
-									}
-
-									for _, r := range d.Type.Results.List {
-										switch rType := r.Type.(type) {
-										case *ast.ArrayType:
-											switch x := rType.Elt.(type) {
-											case *ast.SelectorExpr:
-												paramTypeName := x.X.(*ast.Ident).Name
-												paramTypeSel := x.Sel.Name
-												paramTypeFmt := fmt.Sprintf("%s.%s", paramTypeName, paramTypeSel)
-												if len(r.Names) == 0 {
-													m.returns = append(m.returns, param{name: "", typ: "[]" + paramTypeFmt})
-												} else {
-													for _, n := range r.Names {
-														m.returns = append(m.returns, param{name: n.Name, typ: "[]" + paramTypeFmt})
-													}
-												}
-											}
-										case *ast.StarExpr:
-											switch x := rType.X.(type) {
-											case *ast.SelectorExpr:
-												paramTypeName := x.X.(*ast.Ident).Name
-												paramTypeSel := x.Sel.Name
-												paramTypeFmt := fmt.Sprintf("%s.%s", paramTypeName, paramTypeSel)
-												if len(r.Names) == 0 {
-													m.returns = append(m.returns, param{name: "", typ: "*" + paramTypeFmt})
-												} else {
-													for _, n := range r.Names {
-														m.returns = append(m.returns, param{name: n.Name, typ: "*" + paramTypeFmt})
-													}
-												}
-											}
-										case *ast.SelectorExpr:
-											paramTypeName := rType.X.(*ast.Ident).Name
-											paramTypeSel := rType.Sel.Name
-											paramTypeFmt := fmt.Sprintf("%s.%s", paramTypeName, paramTypeSel)
-											if len(r.Names) == 0 {
-												m.returns = append(m.returns, param{name: "", typ: paramTypeFmt})
-											} else {
-												for _, n := range r.Names {
-													m.returns = append(m.returns, param{name: n.Name, typ: paramTypeFmt})
-												}
-											}
-										case *ast.Ident:
-											if len(r.Names) == 0 {
-												m.returns = append(m.returns, param{name: "", typ: rType.Name})
-											} else {
-												for _, n := range r.Names {
-													m.returns = append(m.returns, param{name: n.Name, typ: rType.Name})
-												}
-											}
-										default:
-											continue
-										}
-									}
-
-									schmock.methods = append(schmock.methods, m)
-								}
-							}
-						}
-					}
-				}
-			}
-		}
+		schmock.methods = append(schmock.methods, m)
 	}
 
 	schmock.methods = slices.SortedFunc(slices.Values(schmock.methods), func(i method, j method) int {
@@ -186,19 +154,19 @@ func main() {
 
 	var outputFile io.Writer
 
-	if *outputFileName == "-" {
+	switch *outputFileName {
+	case "-":
 		outputFile = os.Stdout
-	} else {
+	default:
 		outputFile, err = os.Create(*outputFileName)
 		if err != nil {
-			os.Stderr.WriteString("Error creating output file: " + err.Error() + "\n")
+			_, _ = os.Stderr.WriteString("Error creating output file: " + err.Error() + "\n")
 			os.Exit(1)
 		}
 		if closer, ok := outputFile.(io.Closer); ok {
 			defer closer.Close()
 		}
 	}
-
 	_, err = fmt.Fprintf(outputFile, "package mock\n\n")
 	if err != nil {
 		_, _ = os.Stderr.WriteString("Error writing package statement: " + err.Error() + "\n")
@@ -247,7 +215,79 @@ func main() {
 			os.Exit(1)
 		}
 	}
+}
 
+func collectField(r *ast.Field, unaryStack UnaryOpStack, f ast.Expr) []param {
+	var result []param
+
+	switch rType := f.(type) {
+	case *ast.ArrayType:
+		switch x := rType.Elt.(type) {
+		case *ast.SelectorExpr:
+			result = append(result, collectField(r, append(unaryStack, UnaryStar), x)...)
+
+		case *ast.StarExpr:
+			result = append(result, collectField(r, append(unaryStack, UnarySlice, UnaryStar), x)...)
+
+		case *ast.Ident:
+			result = append(result, collectField(r, append(unaryStack, UnarySlice), x)...)
+
+		case *ast.ArrayType:
+			result = append(result, collectField(r, append(unaryStack, UnarySlice), x)...)
+
+		default:
+			panic(fmt.Sprintf("unhandled array type: %T", x))
+		}
+	case *ast.StarExpr:
+		switch x := rType.X.(type) {
+		case *ast.SelectorExpr:
+			result = append(result, collectField(r, append(unaryStack), x)...)
+		case *ast.StarExpr:
+			result = append(result, collectField(r, append(unaryStack, UnaryStar), x)...)
+		case *ast.Ident:
+			result = append(result, collectField(r, append(unaryStack), x)...)
+		case *ast.ArrayType:
+			result = append(result, collectField(r, append(unaryStack), x)...)
+		default:
+			panic(fmt.Sprintf("unhandled star type: %T", x))
+		}
+	case *ast.SelectorExpr:
+		paramTypeName := rType.X.(*ast.Ident).Name
+		paramTypeSel := rType.Sel.Name
+		paramTypeFmt := unaryStack.String() + fmt.Sprintf("%s.%s", paramTypeName, paramTypeSel)
+		if len(r.Names) == 0 {
+			result = append(result, param{name: "", typ: paramTypeFmt})
+		} else {
+			for _, n := range r.Names {
+				result = append(result, param{name: n.Name, typ: paramTypeFmt})
+			}
+		}
+		return result
+	case *ast.Ident:
+		if len(r.Names) == 0 {
+			result = append(result, param{name: "", typ: rType.Name})
+		} else {
+			for _, n := range r.Names {
+				name := n.Name
+				typ := unaryStack.String() + rType.Name
+				result = append(result, param{name: name, typ: typ})
+			}
+		}
+	default:
+		return result
+	}
+
+	return result
+}
+
+func collectFields(fl *ast.FieldList) []param {
+	var result []param
+
+	for _, r := range fl.List {
+		result = append(result, collectField(r, []UnaryOp{}, r.Type)...)
+	}
+
+	return result
 }
 
 // writeType writes the struct or interface definition for the mock.
